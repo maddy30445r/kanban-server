@@ -1,54 +1,3 @@
-// import { WebSocketServer, WebSocket } from "ws";
-
-// // data structure: roomName → set of connected sockets
-// const rooms = new Map<string, Set<WebSocket>>();
-
-// const wss = new WebSocketServer({ port: 1234 });
-
-// wss.on("connection", (ws, req) => {
-//   // 1. Extract room name from req.url (e.g. "/board-abc" → "board-abc")
-//   const roomName = req.url?.split("/")[1] || "default";
-
-//   // 2. Add ws to rooms[roomName] (create the set if it doesn't exist)
-//   if (!rooms.has(roomName)) {
-//     rooms.set(roomName, new Set<WebSocket>());
-//   }
-//   rooms.get(roomName)?.add(ws);
-
-//   // 3. On 'message', broadcast to all OTHER sockets in the same room
-//   ws.on("message", (data) => {
-//     const message = data.toString();
-//     const sockets = rooms.get(roomName);
-//     if (sockets) {
-//       sockets.forEach((s) => {
-//         if (s != ws && s.readyState === WebSocket.OPEN) {
-//           s.send(message);
-//         }
-//       });
-//     }
-//   });
-//   // 4. On 'close' AND on 'error', remove ws from the room (and delete the room if empty)
-//   const cleanup = () => {
-//     const sockets = rooms.get(roomName);
-//     if (sockets) {
-//   console.log(`${ws} Client disconnected from room ${roomName}`);
-
-//       sockets.delete(ws);
-//       if(sockets.size===0){
-//         rooms.delete(roomName);
-//       }
-//     }
-//   }
-// ws.on("close", cleanup);
-// ws.on("error", cleanup);
-
-//   // 5. Log connect/disconnect with the room name for visibility
-
-//   console.log(`Client connected to room ${roomName}`);
-// });
-
-// console.log("Listening on ws://localhost:1234");
-
 import { WebSocketServer, WebSocket } from "ws";
 import * as Y from "yjs";
 import * as syncProtocol from "y-protocols/sync";
@@ -56,6 +5,10 @@ import * as awarenessProtocol from "y-protocols/awareness";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { Pool } from "pg";
+import { verifyToken, type JwtPayload } from "./auth.js";
+import { startLoginServer } from "./loginServer.js";
+
+startLoginServer();
 
 const messageSync = 0;
 const messageAwareness = 1;
@@ -212,10 +165,46 @@ function broadcast(room: Room, message: Uint8Array, exclude?: WebSocket) {
 
 // --- server ---
 
-const wss = new WebSocketServer({ port: 1234 });
+type AuthedRequest = import("http").IncomingMessage & {
+  userId?: string;
+  userName?: string;
+  userColor?: string;
+};
+
+const wss = new WebSocketServer({
+  port: 1234,
+  verifyClient: (info, done) => {
+    try {
+      const url = new URL(info.req.url!, "ws://localhost");
+      const token = url.searchParams.get("token");
+      if (!token) {
+        return done(false, 401, "missing token");
+      }
+      const payload: JwtPayload = verifyToken(token);
+      const req = info.req as AuthedRequest;
+      req.userId = payload.sub;
+      req.userName = payload.name;
+      req.userColor = payload.color;
+      done(true);
+    } catch {
+      done(false, 401, "invalid token");
+    }
+  },
+});
 
 wss.on("connection", async (ws, req) => {
-  const roomName = req.url?.split("/")[1] || "default";
+  const authedReq = req as AuthedRequest;
+  const userId = authedReq.userId!;
+  const userName = authedReq.userName!;
+  const userColor = authedReq.userColor!;
+
+  // Stash identity on the socket so future code (per-board authz, logging) can read it.
+  (ws as any).userId = userId;
+  (ws as any).userName = userName;
+  (ws as any).userColor = userColor;
+
+  const pathname = new URL(req.url!, "ws://localhost").pathname;
+  const roomName = pathname.split("/")[1] || "default";
 
   // Queue any messages that arrive while we await the room load. The `ws`
   // library does NOT buffer 'message' events that have no listener, so if we
@@ -278,8 +267,14 @@ wss.on("connection", async (ws, req) => {
     }
   };
 
-  // Swap the queueing listener for the real one, then replay what we buffered.
+  // Stop queueing, then drain what the client sent during the load (in arrival
+  // order) BEFORE attaching the live listener. Draining ahead of going live
+  // guarantees buffered messages (e.g. the client's syncStep1) are handled
+  // before any later live message — structurally, rather than relying on this
+  // block staying synchronous.
   ws.off("message", queueHandler);
+  for (const data of earlyMessages) handleMessage(data);
+  earlyMessages.length = 0;
   ws.on("message", handleMessage);
 
   // 5. Send initial sync step 1 to the new client.
@@ -299,11 +294,6 @@ wss.on("connection", async (ws, req) => {
     encoding.writeVarUint8Array(awarenessEncoder, awarenessUpdate);
     send(ws, encoding.toUint8Array(awarenessEncoder));
   }
-
-  // Drain anything the client sent during the load (e.g. its syncStep1), so it
-  // gets a proper reply now that the room is ready.
-  for (const data of earlyMessages) handleMessage(data);
-  earlyMessages.length = 0;
 
   const cleanup = () => {
     awarenessProtocol.removeAwarenessStates(
@@ -326,12 +316,12 @@ wss.on("connection", async (ws, req) => {
       }, EVICT_DELAY);
     }
 
-    console.log(`Client disconnected from room ${roomName}`);
+    console.log(`Client disconnected from room ${roomName} (${userName})`);
   };
   ws.on("close", cleanup);
   ws.on("error", cleanup);
 
-  console.log(`Client connected to room ${roomName}`);
+  console.log(`Client connected to room ${roomName} as ${userName} (${userId})`);
 });
 
 console.log("Listening on ws://localhost:1234");
