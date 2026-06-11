@@ -7,6 +7,8 @@ import * as decoding from "lib0/decoding";
 import { Pool } from "pg";
 import { verifyToken, type JwtPayload } from "./auth.js";
 import { startLoginServer } from "./loginServer.js";
+import { pg } from "./db.js";
+import { isMember } from "./board.js";
 
 startLoginServer();
 
@@ -30,18 +32,6 @@ const EVICT_DELAY = 30_000;
 
 const rooms = new Map<string, Room>();
 const loadingRooms = new Map<string, Promise<Room>>();
-
-const pg = new Pool({
-  host: "localhost",
-  port: 5432,
-  database: "kanban",
-  user: "postgres",
-  password: "dev",
-});
-
-pg.query("SELECT 1")
-  .then(() => console.log("pg connected"))
-  .catch((err) => console.error("pg connection failed:", err));
 
 async function getOrCreateRoom(name: string): Promise<Room> {
   // 1. Already fully loaded → return it.
@@ -218,6 +208,23 @@ wss.on("connection", async (ws, req) => {
   };
   ws.on("message", queueHandler);
 
+  try {
+    const allowed = await isMember(roomName, userId);
+    if (!allowed) {
+      console.log(`Membership denied ${userName}-> ${roomName}`);
+      ws.close(4003, "not a member of this board");
+      ws.off("message", queueHandler);
+      return;
+    }
+  } catch (err) {
+    // DB error → fail closed, but with a DISTINCT code (1011 = WS "internal
+    // error") so the client can tell "server broke" from "not a member".
+    console.error(`Membership check failed for ${roomName}:`, err);
+    ws.close(1011, "internal error");
+    ws.off("message", queueHandler);
+    return;
+  }
+
   const room = await getOrCreateRoom(roomName);
   if (ws.readyState !== WebSocket.OPEN) return;
 
@@ -321,7 +328,9 @@ wss.on("connection", async (ws, req) => {
   ws.on("close", cleanup);
   ws.on("error", cleanup);
 
-  console.log(`Client connected to room ${roomName} as ${userName} (${userId})`);
+  console.log(
+    `Client connected to room ${roomName} as ${userName} (${userId})`,
+  );
 });
 
 console.log("Listening on ws://localhost:1234");

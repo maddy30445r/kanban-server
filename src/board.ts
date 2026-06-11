@@ -9,7 +9,7 @@ export async function isMember(boardId:string,userId:string){
 
 export type BoardSummary={id:string,name:string}
 
-export async function listBoardForUsers(userId:string){
+export async function listBoardsForUser(userId:string){
     const res=await pg.query(
         `SELECT b.id , b.name FROM boards b JOIN board_members m on m.board_id=b.id
         WHERE m.user_id=$1 ORDER by b.name`,[userId]
