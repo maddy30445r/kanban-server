@@ -1,0 +1,1 @@
+CREATE INDEX idx_board_members_user ON board_members(user_id);
