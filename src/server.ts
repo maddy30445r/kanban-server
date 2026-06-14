@@ -4,11 +4,11 @@ import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
-import { Pool } from "pg";
 import { verifyToken, type JwtPayload } from "./auth.js";
 import { startLoginServer } from "./loginServer.js";
 import { pg } from "./db.js";
 import { isMember } from "./board.js";
+import { compactRoom, countRoomRows } from "./compaction.js";
 
 startLoginServer();
 
@@ -22,6 +22,8 @@ type Room = {
   // Pending eviction timer, set when the room goes empty. Cleared if a new
   // client connects before it fires (e.g. a refresh reconnecting).
   evictTimer?: NodeJS.Timeout | undefined;
+  updatesSinceCheck: number; // counts updates since the last threshold COUNT, so we don't COUNT every keystroke
+  compacting: boolean;
 };
 
 // How long a room stays warm in memory after its last client leaves. A refresh
@@ -83,7 +85,13 @@ async function loadRoom(name: string): Promise<Room> {
     console.error(`Failed to load updates for room ${name}:`, err);
   }
 
-  const room: Room = { doc, awareness, connections: new Set() };
+  const room: Room = {
+    doc,
+    awareness,
+    connections: new Set(),
+    updatesSinceCheck: 0,
+    compacting: false,
+  };
 
   // 1. doc.on("update", (update, origin) => ...) — attached AFTER replay.
   doc.on("update", (update, origin) => {
@@ -100,6 +108,29 @@ async function loadRoom(name: string): Promise<Room> {
     syncProtocol.writeUpdate(encoder, update);
     const message = encoding.toUint8Array(encoder);
     broadcast(room, message, origin instanceof WebSocket ? origin : undefined);
+
+    // --- opportunistic threshold compaction ---
+    // Gate the DB COUNT behind an in-memory counter so we don't query on every
+    // keystroke. Only every 25th update do we even check the row count, and only
+    // compact if the room has crossed 100 rows.
+    room.updatesSinceCheck++;
+    if (room.updatesSinceCheck >= 25 && !room.compacting) {
+      room.updatesSinceCheck = 0;
+      room.compacting = true; // serialize: block overlapping compactions on this room
+      countRoomRows(name)
+        .then(async (n) => {
+          if (n >= 100) {
+            await compactRoom(name, doc);
+            console.log(`Compacted room ${name} (was ${n} rows)`);
+          }
+        })
+        .catch((err) =>
+          console.error(`Compaction check failed for ${name}:`, err),
+        )
+        .finally(() => {
+          room.compacting = false; // ALWAYS clear, even on error — else the room never compacts again
+        });
+    }
   });
 
   // 2. awareness.on("update", ...) — broadcast presence changes to the room.
@@ -315,11 +346,24 @@ wss.on("connection", async (ws, req) => {
     // actually evict if it's still empty when the timer fires.
     if (room.connections.size === 0 && !room.evictTimer) {
       room.evictTimer = setTimeout(() => {
-        if (room.connections.size === 0) {
-          rooms.delete(roomName);
-          room.doc.destroy();
-          console.log(`Evicted idle room ${roomName}`);
-        }
+        if (room.connections.size !== 0) return; // someone reconnected during the grace window — abort evict
+
+        // Compact while the doc is STILL in memory (a free snapshot), THEN destroy.
+        compactRoom(roomName, room.doc)
+          .then(() => console.log(`Compacted ${roomName} on evict`))
+          .catch((err) =>
+            console.error(`Evict-time compaction failed for ${roomName}:`, err),
+          )
+          .finally(() => {
+            // Re-check: compaction is async, so a client may have connected DURING it.
+            // Only destroy the doc if the room is still empty — never yank a doc
+            // out from under a freshly-connected client.
+            if (room.connections.size === 0) {
+              rooms.delete(roomName);
+              room.doc.destroy();
+              console.log(`Evicted idle room ${roomName}`);
+            }
+          });
       }, EVICT_DELAY);
     }
 
