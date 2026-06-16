@@ -15,7 +15,7 @@
   "license": "ISC",
   "type": "module",
   "engines": {
-    "node": ">=20.6"
+   "node": "22.x"
   },
   "dependencies": {
     "@types/node": "^25.9.3",
