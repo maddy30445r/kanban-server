@@ -4,13 +4,12 @@ import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
+import http from "http";
 import { verifyToken, type JwtPayload } from "./auth.js";
-import { startLoginServer } from "./loginServer.js";
+import { handleAuthRequest } from "./loginServer.js";
 import { pg } from "./db.js";
 import { isMember } from "./board.js";
 import { compactRoom, countRoomRows } from "./compaction.js";
-
-startLoginServer();
 
 const messageSync = 0;
 const messageAwareness = 1;
@@ -192,25 +191,41 @@ type AuthedRequest = import("http").IncomingMessage & {
   userColor?: string;
 };
 
-const wss = new WebSocketServer({
-  port: 1234,
-  verifyClient: (info, done) => {
-    try {
-      const url = new URL(info.req.url!, "ws://localhost");
-      const token = url.searchParams.get("token");
-      if (!token) {
-        return done(false, 401, "missing token");
-      }
-      const payload: JwtPayload = verifyToken(token);
-      const req = info.req as AuthedRequest;
-      req.userId = payload.sub;
-      req.userName = payload.name;
-      req.userColor = payload.color;
-      done(true);
-    } catch {
-      done(false, 401, "invalid token");
+const PORT = Number(process.env.PORT) || 1234;
+
+// One HTTP server handles all auth routes (and /healthz); non-matching paths
+// 404 inside the handler. The WebSocket upgrade is driven manually below.
+const httpServer = http.createServer((req, res) => {
+  handleAuthRequest(req, res);
+});
+
+// WebSocketServer in noServer mode — we drive the upgrade ourselves.
+const wss = new WebSocketServer({ noServer: true });
+
+// Manual upgrade = where AUTHENTICATION (valid JWT?) lives now. A missing or
+// invalid token gets a raw 401 + destroyed socket. AUTHORIZATION (board
+// membership) stays post-upgrade in wss.on("connection") as ws.close(4003).
+httpServer.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url!, "ws://localhost");
+    const token = url.searchParams.get("token");
+    if (!token) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
     }
-  },
+    const payload: JwtPayload = verifyToken(token);
+    const authedReq = req as AuthedRequest;
+    authedReq.userId = payload.sub;
+    authedReq.userName = payload.name;
+    authedReq.userColor = payload.color;
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+  }
 });
 
 wss.on("connection", async (ws, req) => {
@@ -377,4 +392,6 @@ wss.on("connection", async (ws, req) => {
   );
 });
 
-console.log("Listening on ws://localhost:1234");
+httpServer.listen(PORT, () => {
+  console.log(`Server (WS + auth) listening on :${PORT}`);
+});

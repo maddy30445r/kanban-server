@@ -11,10 +11,8 @@ import {
   isMember,
 } from "./board.js";
 
-const PORT = 1235;
-
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": process.env.FRONTEND_ORIGIN || "*",
   "Access-Control-Allow-Methods": "GET, POST,DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
@@ -49,8 +47,18 @@ function readJsonBody(req: http.IncomingMessage): Promise<any> {
   });
 }
 
-export function startLoginServer() {
-  const server = http.createServer((req, res) => {
+export function handleAuthRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+) {
+  // Health check — keep-alive pingers hit this. No auth, no DB query.
+  if (req.method === "GET" && req.url === "/healthz") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+
+  {
     if (req.method === "OPTIONS") {
       res.writeHead(204, corsHeaders);
       res.end();
@@ -231,11 +239,5 @@ export function startLoginServer() {
 
     res.writeHead(404, corsHeaders);
     res.end();
-  });
-
-  server.listen(PORT, () => {
-    console.log(`Auth server on http://localhost:${PORT}`);
-  });
-
-  return server;
+  }
 }

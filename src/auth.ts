@@ -1,6 +1,8 @@
 import jwt from "jsonwebtoken";
 
-export const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+const secret = process.env.JWT_SECRET;
+if (!secret) throw new Error("JWT_SECRET is not set");
+export const JWT_SECRET: string = secret;
 
 export type JwtPayload = {
   sub: string; // userId
